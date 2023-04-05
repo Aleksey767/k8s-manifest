@@ -1,0 +1,145 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  namespace: nginx
+  name: nginx-ingress
+spec:
+  rules:
+    - host: my-web-app.uk
+      http:
+        paths: /web-app
+        -backend:
+          service:
+          serviceName: webapp-service
+          servicePort: 8080
+          path: /api
+          pathType: Prefix
+  tls:
+    - hosts:
+        - my-web-app.uk
+      secretName: my-tls-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: nginx
+  namespace: nginx
+  name: nginx-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+  selector:
+    app: nginx
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: nginx
+  name: nginx-deployment
+  namespace: nginx
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: nginx
+  selector: # селектор, который определяет, какие поды должны быть созданы на основе меток.
+    matchLabels:
+      app: nginx
+  spec:
+    hostNetwork: true # разрешаем использовать сеть ноды
+    affinity: # определяет аффинити (взаимосвязь) между подами
+      podAntiAffinity: # раскидываем по зонам
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+      podAffinityTerm: #  определяет, какие поды должны быть разбросаны по разным зонам.
+        labelSelector:
+          matchExpressions:
+            - key: webapp
+              operator: In
+              values:
+                - nginx
+          topologyKey: failure-domain.beta.kubernetes.io/zone
+    containers: # список контейнеров, которые будут запущены в поде.26
+      - image: nginx
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10 # инициализация 10 сек или можно задать 5
+          periodSeconds: 20 # каждые 20 сек
+        livenessProbe:
+          httpGet:
+            path: /healthz #отправляем сюда запрос, чекаем живой ли он
+            port: 8080
+          initialDelaySeconds: 10 # ждем 10 сек после старта
+          periodSeconds: 20 # каждые 20 сек
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi" #
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        name: nginx-pod
+        ports:
+          - containerPort: 80
+
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx-deployment
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50 # если больше 50% ЦПУ то начинаем увелич реплики
+
+#autoscaler image kubectl + creditals to app
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: scale-up
+spec:
+  schedule: "0 10 * * *" # запускает задачу ежедневно в 10:00
+  jobTemplate: # определяет шаблон задачи, которая будет запускаться по расписанию
+    spec:
+      template:
+        spec:
+          containers:
+            - name: nginx-cron
+              image: nginx-cron-image
+              args: ["kubectl", "scale", "--replicas=3", "deployment/nginx"] # масштабируем до 3
+          restartPolicy: OnFailure # рестарт если ошибка
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: scale-down
+spec:
+  schedule: "0 23 * * *" # запускает задачу ежедневно в 23:00
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: nginx-cron
+              image: nginx-cron-image
+              args: ["kubectl", "scale", "--replicas=1", "deployment/nginx"] # уменьшаем до 1
+          restartPolicy: OnFailure # рестарт если ошибка
